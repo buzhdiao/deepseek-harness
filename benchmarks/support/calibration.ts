@@ -1,8 +1,10 @@
 /** Shared conversion from reference-machine expectations to CI time budgets. */
 
 /** Measured wall-time ratio between the x64 CI runner and the arm64 reference machine. */
+// x64 CI 运行器相对 arm64 参考机（reference machine）的实测墙钟时间倍率。
 export const CI_TIME_SCALE = 2
 /** Allowed variance above the calibrated expectation. */
+// 校准期望值之上允许的方差余量（headroom）。
 export const PERFORMANCE_BUDGET_HEADROOM = 1.25
 
 /**

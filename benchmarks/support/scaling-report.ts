@@ -23,11 +23,15 @@ import { join } from 'node:path'
 import { MACHINE_PROFILES, matchMachineProfile } from './machine-profiles.ts'
 
 /** Directory owning `results.jsonl` and `report.html`; ignored by Git. */
+// 报告目录：存放 results.jsonl 与 report.html（被 Git 忽略）。
 export const REPORT_DIRECTORY = join(import.meta.dirname, '..', '.dsh-report')
+// 结果 JSONL 文件路径。
 const RESULTS_PATH = join(REPORT_DIRECTORY, 'results.jsonl')
+// 渲染出的 HTML 报告路径。
 const REPORT_PATH = join(REPORT_DIRECTORY, 'report.html')
 
 /** Identity and reader-facing description of one benchmark case, shown when hovering its rows in the report. */
+// 一个基准用例（case）的标识与面向读者的描述，悬停报告行时展示。
 export interface BenchmarkCase {
   /** Case id, such as `session-open/first-open/phases`. */
   readonly id: string
@@ -38,13 +42,18 @@ export interface BenchmarkCase {
 }
 
 /** Fields that every record copies from its {@link BenchmarkCase}. */
+// 每条记录从所属用例复制的公共字段。
 interface CaseFields {
+  // 用例 id。
   readonly benchmark: string
+  // 测量内容描述。
   readonly measures: string
+  // 影响的用户场景。
   readonly affects: string
 }
 
 function caseFields(benchmarkCase: BenchmarkCase): CaseFields {
+  // 把用例元数据展开为记录的公共字段。
   return { benchmark: benchmarkCase.id, measures: benchmarkCase.measures, affects: benchmarkCase.affects }
 }
 
@@ -59,8 +68,11 @@ export type Timing =
 
 /** One recorded wall-clock endpoint. */
 export type TimingRecord = CaseFields & Timing & {
+  // 记录种类：时间端点。
   readonly kind: 'time'
+  // 端点名称。
   readonly metric: string
+  // 可选的该端点 CI 预算（毫秒）。
   readonly budgetMs?: number
 }
 
@@ -75,16 +87,23 @@ export function recordTimings(
   timings: Readonly<Record<string, Timing>>,
   budgetsMs: Readonly<Record<string, number>> = {},
 ): void {
+  // 把每个端点转换为一条时间记录并追加到结果文件。
   appendRecords(Object.entries(timings).map(([metric, timing]): TimingRecord => {
+    // 读取该端点的预算（可能未定义）。
     const budgetMs = budgetsMs[metric]
+    // 组装记录：公共字段 + 端点名 + 计时 + 可选预算。
     return { kind: 'time', ...caseFields(benchmarkCase), metric, ...timing, ...budgetMs === undefined ? {} : { budgetMs } }
   }))
 }
 
 /** One recorded peak memory measurement. */
+// 一条已记录的峰值内存测量。
 export interface MemoryRecord extends CaseFields {
+  // 记录种类：峰值内存。
   readonly kind: 'memory'
+  // 测量名称。
   readonly metric: string
+  // 峰值 MB 数。
   readonly mb: number
 }
 
@@ -94,11 +113,14 @@ export interface MemoryRecord extends CaseFields {
  * @param peaksMb - Peak megabytes keyed by measurement name, such as `peakRssMb`.
  */
 export function recordPeakMemory(benchmarkCase: BenchmarkCase, peaksMb: Readonly<Record<string, number>>): void {
+  // 把每个峰值测量转换为一条内存记录并追加到结果文件。
   appendRecords(Object.entries(peaksMb).map(([metric, mb]): MemoryRecord => ({ kind: 'memory', ...caseFields(benchmarkCase), metric, mb })))
 }
 
 function appendRecords(records: readonly (TimingRecord | MemoryRecord)[]): void {
+  // 确保报告目录存在。
   mkdirSync(REPORT_DIRECTORY, { recursive: true })
+  // 把每条记录序列化为一行 JSON，追加到结果文件。
   appendFileSync(RESULTS_PATH, records.map(record => JSON.stringify(record) + '\n').join(''))
 }
 
@@ -108,24 +130,35 @@ function appendRecords(records: readonly (TimingRecord | MemoryRecord)[]): void 
  * @throws If the value is not a known phase.
  */
 function reportPhase(): 'first' | 'last' | 'all' {
+  // 读取分阶段运行的环境变量。
   const raw = process.env.DSH_BENCH_REPORT_PHASE
+  // 未设置或为 all 时视为单次完整运行（既清空也渲染）。
   if (raw === undefined || raw === '' || raw === 'all') return 'all'
+  // first/last 分别代表清空结果的阶段与渲染报告的阶段。
   if (raw === 'first' || raw === 'last') return raw
+  // 未知取值直接报错。
   throw new Error(`DSH_BENCH_REPORT_PHASE must be "first", "last", or "all", got ${JSON.stringify(raw)}.`)
 }
 
 /** Vitest global setup: discard results of an earlier run unless this phase continues one. */
 export function setup(): void {
+  // last 阶段不清理（需要延续 first 阶段写入的结果）。
   if (reportPhase() === 'last') return
+  // 递归删除上次运行的报告目录。
   rmSync(REPORT_DIRECTORY, { recursive: true, force: true })
 }
 
 /** Vitest global teardown: render the report when a case recorded a timing and this phase owns the report. */
 export function teardown(): void {
+  // first 阶段不渲染（结果尚未写完）。
   if (reportPhase() === 'first') return
+  // 没有任何记录文件时直接跳过。
   if (!existsSync(RESULTS_PATH)) return
+  // 逐行读入并解析全部记录。
   const records = readFileSync(RESULTS_PATH, 'utf8').split('\n').filter(line => line !== '').map(line => JSON.parse(line) as TimingRecord | MemoryRecord)
+  // 读取测量机的 CPU 型号（失败时给出占位文本）。
   const cpuModel = cpus()[0]?.model.trim() ?? 'unknown CPU'
+  // 渲染报告并写出（内嵌记录与测量环境）。
   writeFileSync(REPORT_PATH, renderReport({
     records,
     cpuModel,
@@ -136,16 +169,24 @@ export function teardown(): void {
     cores: availableParallelism(),
     measuredProfile: matchMachineProfile(cpuModel),
   }))
+  // 在控制台提示报告路径。
   console.log(`benchmark report: ${REPORT_PATH}`)
 }
 
 /** Inputs embedded in one rendered report. */
+// 内嵌到渲染报告中的输入数据。
 export interface ReportData {
+  // 全部时间与内存记录。
   readonly records: readonly (TimingRecord | MemoryRecord)[]
+  // 测量机的 CPU 型号。
   readonly cpuModel: string
+  // 平台与架构。
   readonly platform: string
+  // Node 版本。
   readonly node: string
+  // Git 提交号（CI 上存在）。
   readonly revision: string | undefined
+  // 报告生成时间（ISO 字符串）。
   readonly generatedAt: string
   /** Logical CPUs available to the measuring process; replaces the matched profile's core count. */
   readonly cores: number
@@ -159,7 +200,9 @@ export interface ReportData {
  * @returns HTML without external resources.
  */
 export function renderReport(data: ReportData): string {
+  // 序列化报告数据与全部机型配置；转义 < 防止内联脚本内容提前闭合标签。
   const payload = JSON.stringify({ ...data, profiles: MACHINE_PROFILES }).replaceAll('<', '\\u003c')
+  // 返回自包含的 HTML 页面（模板字符串内嵌全部页面与脚本，内部不可插注释）。
   return `<!doctype html>
 <html lang="en">
 <head>

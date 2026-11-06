@@ -13,20 +13,28 @@
  */
 
 /** One modelled machine with its CPU and default-storage performance. */
+// 一台建模机器：CPU 性能与默认存储性能的配置描述。
 export interface MachineProfile {
+  // 配置 id（报告中引用的唯一标识）。
   readonly id: string
+  // 展示用名称。
   readonly label: string
+  // CPU 型号描述文本。
   readonly cpu: string
+  // PassMark 单线程评分，用于缩放 CPU 密集份额。
   readonly cpuScore: number
   /** Logical CPUs: hardware threads on laptops, vCPUs on cloud instances. */
   readonly cores: number
+  // 默认存储描述。
   readonly storage: string
+  // 默认存储在队列深度 1 下的典型 4 KiB 随机访问延迟（微秒），用于缩放 IO 份额。
   readonly ioLatencyUs: number
   /** Lower-case substrings of `os.cpus()[0].model` that identify the measuring machine as this profile. */
   readonly cpuModelMatches?: readonly string[]
 }
 
 /** Profiles in report order. */
+// 按报告展示顺序排列的全部机型配置（数据行，不再逐条注释）。
 export const MACHINE_PROFILES: readonly MachineProfile[] = [
   { id: 'laptop-2015-win', label: '2015 Windows laptop', cpu: 'Intel Core i5-5200U', cpuScore: 1486, cores: 4, storage: 'SATA SSD', ioLatencyUs: 90 },
   { id: 'laptop-2015-mac', label: '2015 MacBook Pro 13"', cpu: 'Intel Core i5-5257U', cpuScore: 1737, cores: 4, storage: 'PCIe AHCI SSD', ioLatencyUs: 90 },
@@ -53,6 +61,8 @@ export const MACHINE_PROFILES: readonly MachineProfile[] = [
  * @returns the matching profile id, or `undefined` when no profile describes the machine.
  */
 export function matchMachineProfile(cpuModel: string): string | undefined {
+  // 转为小写以便与 cpuModelMatches 的小写子串匹配。
   const model = cpuModel.toLowerCase()
+  // 返回第一个 cpuModelMatches 命中的配置的 id；都不匹配则返回 undefined。
   return MACHINE_PROFILES.find(profile => profile.cpuModelMatches?.some(match => model.includes(match)) === true)?.id
 }

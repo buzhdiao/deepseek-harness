@@ -51,9 +51,7 @@ import { createScope } from '@deepseek-ai/dsh-scope'
 import type { EpochHeader, RequestContext, Session, SessionId, SessionSeq, TurnEndReason, UserMessage } from '@deepseek-ai/dsh-session'
 // 会话原语：规范化头部、头部相等比较、工具调用恢复观察器。
 import { canonicalHeader, headerEquals, ToolCallRecovery } from '@deepseek-ai/dsh-session'
-// 系统提示词：段落合并/渲染与最终提示词渲染。
-import { joinContextSections, renderContextSections, renderPrompt } from '@deepseek-ai/dsh-system-prompt'
-// 提示词组装结果类型。
+import { renderContextSections, renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import type { PromptAssembly } from '@deepseek-ai/dsh-system-prompt'
 // 工具侧错误：激活失败与批量执行失败。
 import { ToolActivationError, ToolBatchExecutionError } from '@deepseek-ai/dsh-tools'
@@ -205,6 +203,7 @@ export class ReactLoopAgent implements Agent {
     public readonly session: Session,
     projections: LoopProjections,
     lastTurn: number,
+    private readonly lifetimeSignal: AbortSignal,
   ) {
     // 记录附着时的 surface 世代。
     this.requestSurfaceGeneration = session.surface.contentGeneration
@@ -273,14 +272,15 @@ export class ReactLoopAgent implements Agent {
 
   // 取消：默认清空收件箱并中止当前活动；keepInbox 则保留排队输入。
   cancel(cause: AgentCancelCause, options: CancelOptions = {}): void {
-    if (!options.keepInbox) {
-      // 清空收件箱。
-      this.inbox.clear()
-      // 排队输入已清：撤销被闩住的唤醒请求。
-      if (this.phase.kind !== 'idle') this.phase.wakeRequested = false
+    try {
+      if (!options.keepInbox) this.inbox.clear()
+    } finally {
+      // Queue persistence must not prevent cancellation of admitted work.
+      if (this.phase.kind !== 'idle') {
+        if (!options.keepInbox) this.phase.wakeRequested = false
+        this.phase.abort.abort(cause)
+      }
     }
-    // 非空闲相位：以给定原因中止当前活动的信号。
-    if (this.phase.kind !== 'idle') this.phase.abort.abort(cause)
   }
 
   // 维护窗口：空闲时才能进入；以维护专用信号运行任务，结束后回 idle 并重放闩住的唤醒。
@@ -325,7 +325,7 @@ export class ReactLoopAgent implements Agent {
    *   the inbox insertion so a reentrant cancel cannot reclassify it.
    */
   private wakeDriver(wakeAfterAbort = false): void {
-    // 非空闲：无法立即启动驱动器。
+    if (this.lifetimeSignal.aborted) return
     if (this.phase.kind !== 'idle') {
       // Maintenance and aborted drivers cannot deliver the wake: latch it for
       // replay at convergence. Live drivers claim queued work themselves;
@@ -415,7 +415,7 @@ export class ReactLoopAgent implements Agent {
         (): Promise<PreStepDecision> => {
           // 渲染上下文段落并投影出运行期上下文消息。
           const sections = renderContextSections(assembly)
-          const context = this.runtimeContext.project(joinContextSections(sections), sections)
+          const context = this.runtimeContext.project(sections)
           return Promise.resolve<PreStepDecision>({
             kind: 'enter',
             messages: context === undefined ? claimed : [...claimed, context],
@@ -607,7 +607,7 @@ export class ReactLoopAgent implements Agent {
         ...assembleContextFor(this, signal), modelSelection: decision.selection,
       })
       const sections = renderContextSections(currentContext)
-      const context = this.runtimeContext.project(joinContextSections(sections), sections)
+      const context = this.runtimeContext.project(sections)
       signal.throwIfAborted()
       // 是否开启新的请求系列（仅首尝试）。
       const startsRequestSeries = firstAttempt && decision.startsRequestSeries === true
@@ -739,8 +739,7 @@ export class ReactLoopAgent implements Agent {
           )
           signal.throwIfAborted()
           if (action?.kind !== 'retry') {
-            // 不重试：抛结构化 LLM 错误。
-            throw new LlmError(finish.failure.message, finish.failure.code, finish.failure)
+            throw LlmError.fromFailure(finish.failure)
           }
           // 重试：回到尝试循环开头。
           continue

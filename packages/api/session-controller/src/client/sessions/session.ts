@@ -100,7 +100,16 @@ interface PendingHistory {
   readonly pages: (readonly SessionEventLikeEntry[])[]
 }
 
-// 管理器持有的会话对象本地状态边沿观察者。
+interface OlderHistoryRequest {
+  readonly generation: number
+  readonly beforeSeq: SessionLogOffset
+  page: { readonly entries: readonly SessionEventLikeEntry[]; readonly hasMore: boolean } | null
+  invalidated: boolean
+  recovering: boolean
+  consuming: boolean
+  promise?: Promise<void>
+}
+
 /** Manager-owned observers of a Session object's local state edges. */
 export interface SessionOptions {
   // 目录发现的地址：选择非激活的子代理传输路径。
@@ -135,7 +144,7 @@ export class Session implements SessionFace {
   private baseSeq = SessionLogOffset(0)
   // 是否仍有更早历史可加载。
   private hasMore = false
-  // 打开状态：cold（未打开）/ loading / open / error。
+  private historyWasPartial = false
   private openState: OpenState = 'cold'
   // 打开失败时的远程错误。
   private openError: RemoteFailure | null = null
@@ -145,9 +154,9 @@ export class Session implements SessionFace {
    *  passes drop all writes once the generation moves on. */
   // 流替换时递增，使在途 doOpen 失效；旧世代一旦过气就丢弃全部写入。
   private openGeneration = 0
-  // 是否正在向前翻页（加载更早）。
-  private loadingOlder = false
-  // 运行中跳转循环共享的低水位目标；无跳转时为 null。
+  private get loadingOlder(): boolean { return this.historyLoadStatus === 'loading' }
+  private historyLoadStatus: SessionSnapshot['historyLoadStatus'] = 'idle'
+  private olderRequest: OlderHistoryRequest | null = null
   /** Shared low-water target of the running jump loop; null when no jump is paging. */
   private jumpTargetSeq: SessionSeq | null = null
   // 运行中跳转循环的完成 Promise；重定向目标的调用者共享它。
@@ -548,39 +557,95 @@ export class Session implements SessionFace {
     return promise
   }
 
-  // 前插一个回合对齐的分页：至少 50 条消息与 2 个回合起点，上限 500 条。
-  /** Prepend one Turn-aligned page: at least 50 messages and two Turn starts, capped at 500 messages. */
-  async loadOlder(): Promise<void> {
-    // 仅在已打开、仍有更早历史且不在加载中时执行。
-    if (this.openState !== 'open' || !this.hasMore || this.loadingOlder) return
-    // 捕获当前事件流。
+  /** @inheritdoc */
+  async loadOlder(options?: { deferConsumption?: boolean }): Promise<void> {
+    const request = this.prepareOlder()
+    await request?.promise
+    if (request !== null && this.olderRequest === request
+      && (!options?.deferConsumption || request.page?.entries.length === 0)) this.consumeOlder()
+  }
+
+  private prepareOlder(): OlderHistoryRequest | null {
+    if (this.olderRequest !== null) return this.olderRequest
     const events = this.events
-    if (events === undefined) return
-    // 置忙并刷新快照。
-    this.loadingOlder = true
+    if (this.openState !== 'open' || !this.hasMore || this.loadingOlder || events === undefined) return null
+    const request: OlderHistoryRequest = {
+      generation: this.openGeneration,
+      beforeSeq: this.baseSeq,
+      page: null,
+      invalidated: false,
+      recovering: false,
+      consuming: false,
+    }
+    this.olderRequest = request
+    this.historyLoadStatus = 'loading'
     this.notifier.markDirty()
-    try {
-      // 前插一页。
-      await events.prepend({
-        beforeSeq: this.baseSeq,
-        ...HISTORY_PAGE_OPTIONS,
-      })
-    } catch (error) {
-      // 非远程失败（本地/编程错误）记录到控制台；远程失败交由错误状态呈现。
-      if (!isRemoteFailure(error)) {
-        console.error('[session-controller] loadOlder failed:', error)
+    request.promise = (async () => {
+      try {
+        await events.prepend({ beforeSeq: request.beforeSeq, ...HISTORY_PAGE_OPTIONS })
+        if (this.olderRequest !== request) return
+        if (request.invalidated || request.generation !== this.openGeneration || request.beforeSeq !== this.baseSeq) return
+        const page = request.page
+        const first = page?.entries[0]
+        this.historyLoadStatus = page === null || (first === undefined ? page.hasMore : first.event.seq >= request.beforeSeq)
+          ? 'error' : 'pendingConsumption'
+      } catch (error) {
+        if (this.olderRequest !== request) return
+        request.page = null
+        this.historyLoadStatus = 'error'
+        if (!isRemoteFailure(error)) console.error('[session-controller] loadOlder failed:', error)
+      } finally {
+        if (this.olderRequest === request) {
+          if (request.invalidated && this.events === events) {
+            // A replacement restores the transport cursor before another page uses the visible window.
+            request.recovering = true
+            this.historyLoadStatus = 'loading'
+            events.restart()
+          } else if (this.historyLoadStatus === 'error') this.olderRequest = null
+          this.notifier.markDirty()
+        }
       }
+    })()
+    return request
+  }
+
+  /** @inheritdoc */
+  consumeOlder(): boolean {
+    const request = this.olderRequest
+    if (request === null || request.consuming || this.historyLoadStatus !== 'pendingConsumption' || request.page === null) return false
+    if (this.openState !== 'open' || request.invalidated || request.generation !== this.openGeneration
+      || request.beforeSeq !== this.baseSeq) {
+      this.clearOlderHistory()
+      return false
+    }
+    const page = request.page
+    // Retain the request through synchronous feed notification so subscribers cannot reenter consumption.
+    request.consuming = true
+    try {
+      this.prependWindow(page.entries, page.hasMore)
+      return true
+    } catch (error) {
+      if (this.olderRequest === request) this.historyLoadStatus = 'error'
+      throw error
     } finally {
-      // 解除忙标志并刷新。
-      this.loadingOlder = false
+      if (this.olderRequest === request) {
+        this.olderRequest = null
+        if (this.historyLoadStatus !== 'error') this.historyLoadStatus = 'idle'
+      }
       this.notifier.markDirty()
     }
   }
 
-  // 跳转加载：向后翻页直到窗口覆盖目标序号。
+  private clearOlderHistory(): void {
+    this.olderRequest = null
+    this.historyLoadStatus = this.pendingHistory === null ? 'idle' : 'loading'
+    this.notifier.markDirty()
+  }
+
   /** Jump loader: page backwards until the window covers seq (see ISession.loadThrough). */
   loadThrough(seq: SessionSeq): Promise<void> {
-    // 未打开、无更早历史或目标已在窗口内：无需加载。
+    this.consumeOlder()
+    if (this.olderRequest !== null) return Promise.resolve()
     if (this.openState !== 'open' || !this.hasMore || this.baseSeq <= seq) return Promise.resolve()
     if (this.jumpPromise !== null) {
       // Retarget the running loop to the lowest requested seq.
@@ -607,8 +672,7 @@ export class Session implements SessionFace {
     this.pendingHistory = pending
     // 设置跳转目标。
     this.jumpTargetSeq = seq
-    // 置忙并刷新。
-    this.loadingOlder = true
+    this.historyLoadStatus = 'loading'
     this.notifier.markDirty()
     // Stale-pass guard (the doOpen pattern): a resync mid-loop replaces the
     // stream generation; this pass then stops instead of paging the new
@@ -618,34 +682,36 @@ export class Session implements SessionFace {
     // 启动跳转循环。
     this.jumpPromise = (async () => {
       try {
-        // 持续翻页直到覆盖目标或没有更多历史。
-        while (pending.hasMore && this.jumpTargetSeq !== null && pending.beforeSeq > this.jumpTargetSeq) {
-          // 世代已变：放弃本趟。
+        while (this.jumpTargetSeq !== null && pending.beforeSeq > this.jumpTargetSeq) {
           if (generation !== this.openGeneration) return
           // 记录翻页前的上界。
           const before = pending.beforeSeq
           await events.prepend({ beforeSeq: before, ...JUMP_PAGE_OPTIONS })
+          if (generation !== this.openGeneration || this.pendingHistory !== pending) return
           // No-progress guard: an empty or dropped page that still claims more
           // history must end the loop, not spin it.
-          // 无进展守卫：上界未前移的空页必须终止循环，不能自旋。
-          if (pending.beforeSeq >= before) return
+          if (pending.beforeSeq >= before) {
+            if (pending.hasMore) this.historyLoadStatus = 'error'
+            return
+          }
+          if (!pending.hasMore) return
         }
       } catch (error) {
-        // 非远程失败记录到控制台。
+        if (generation === this.openGeneration && this.pendingHistory === pending) this.historyLoadStatus = 'error'
         if (!isRemoteFailure(error)) {
           console.error('[session-controller] loadThrough failed:', error)
         }
       } finally {
-        // 清理跳转状态。
-        this.jumpTargetSeq = null
-        this.jumpPromise = null
-        this.pendingHistory = null
-        this.loadingOlder = false
-        if (generation === this.openGeneration && pending.pages.length > 0) {
-          // 本世代有效且收集到页面：整体前插进窗口。
-          this.prependWindow(pending.pages.reverse().flat(), pending.hasMore)
+        if (this.pendingHistory === pending) {
+          this.jumpTargetSeq = null
+          this.jumpPromise = null
+          this.pendingHistory = null
+          if (this.historyLoadStatus === 'loading') this.historyLoadStatus = 'idle'
+          if (generation === this.openGeneration && pending.pages.length > 0) {
+            this.prependWindow(pending.pages.reverse().flat(), pending.hasMore)
+          }
+          this.notifier.markDirty()
         }
-        this.notifier.markDirty()
       }
     })()
     return this.jumpPromise
@@ -660,6 +726,7 @@ export class Session implements SessionFace {
     if (this.openState === 'cold') return // never opened: no window to rebuild (doOpen flips to 'loading' synchronously, so cold implies no in-flight open)
     // 递增世代使在途打开全部失效。
     this.openGeneration++
+    this.clearOlderHistory()
     const events = this.events
     // 摘除事件流。
     this.events = undefined
@@ -792,6 +859,7 @@ export class Session implements SessionFace {
     }
     // 递增世代使后续回调失效。
     this.openGeneration++
+    this.clearOlderHistory()
     const events = this.events
     this.events = undefined
     // 销毁事件流。
@@ -858,7 +926,9 @@ export class Session implements SessionFace {
         return
       // 前插一页。
       case 'prepend':
-        this.prependWindow(change.entries, change.hasMore)
+        if (this.olderRequest !== null) {
+          this.olderRequest.page = { entries: change.entries, hasMore: change.hasMore }
+        } else this.prependWindow(change.entries, change.hasMore)
         return
       // 追加存活事件：先过助手流聚合器再发布。
       case 'append':
@@ -883,9 +953,13 @@ export class Session implements SessionFace {
     // page/baseline pair instead of applying it to an unrelated repair cut.
     // 持久间隙修复页不带助手流基线；清空瞬时尝试让悬挂通知以原子方式重开 follow。
     const visible = this.assistantStream.replace(entries, assistantStream)
-    // 更新窗口基线与分页标志。
+    if (this.olderRequest !== null && this.loadingOlder && !this.olderRequest.recovering) {
+      this.olderRequest.invalidated = true
+      this.olderRequest.page = null
+    } else this.clearOlderHistory()
     this.baseSeq = SessionLogOffset(entries[0]?.event.seq ?? 0)
     this.hasMore = hasMore
+    this.historyWasPartial ||= hasMore
     if (this.pendingHistory !== null) {
       // 同步跳转收集状态：新基线、新 hasMore，并清空已收集页。
       this.pendingHistory.beforeSeq = this.baseSeq
@@ -968,6 +1042,7 @@ export class Session implements SessionFace {
     // 常规前插：更新基线与标志。
     this.baseSeq = entries[0] === undefined ? this.baseSeq : SessionLogOffset(entries[0].event.seq)
     this.hasMore = hasMore
+    this.historyWasPartial ||= hasMore
     this.eventSource.prepend(entries, hasMore)
   }
 
@@ -1164,6 +1239,7 @@ export class Session implements SessionFace {
     if (!isRemoteFailure(error)) throw error
     // 递增世代并进入错误状态。
     this.openGeneration++
+    this.clearOlderHistory()
     this.events = undefined
     this.openPromise = null
     this.openState = 'error'
@@ -1194,7 +1270,9 @@ export class Session implements SessionFace {
       openState: this.openState,
       openError: this.openError,
       hasMore: this.hasMore,
+      historyWasPartial: this.historyWasPartial,
       loadingOlder: this.loadingOlder,
+      historyLoadStatus: this.historyLoadStatus,
       promptError: this.promptError,
       blank: this.blankBit,
       lastAgentError: this.lastAgentError,

@@ -23,9 +23,8 @@ export const DONE = 'SYNTHETIC_REPLY_DONE'
 /** Paced text chunks per continuation. */
 // 中文补充（常量 JSDoc）：每次续跑（continuation）发送的节奏化文本 chunk 数。
 export const DELTAS = 120
-/** Replay delay per stream chunk, in milliseconds. */
-// 中文补充（常量 JSDoc）：回放时每个流式 chunk 之间的延迟（毫秒）。
-export const PACE_MS = 16
+/** Replay delay per stream chunk, in milliseconds; keeps the input-overlap probe inside the stream on loaded CI runners. */
+export const PACE_MS = 32
 
 /** Create mixed prose, code, reasoning and tool history without reading user data.
  * @returns Current Session JSONL accepted by the shared Web seeder.

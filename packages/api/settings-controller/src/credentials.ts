@@ -65,6 +65,7 @@ function projectCredentialInfo(info: CredentialInfo): CredentialInfo {
     ...info.source === undefined ? {} : { source: info.source },
     // 是否可写
     writable: info.writable,
+    ...info.masked === undefined ? {} : { masked: info.masked },
   }
 }
 
@@ -77,10 +78,11 @@ declare module '@deepseek-ai/cordis' {
 }
 
 /**
- * 为生成的 `ctx.remote.credentials` 命名空间提供后端的宿主服务。它承担凭据接缝
- * （credential seam）本身不负责的所有线上义务：批量扇出上限、逐字段的视图投影、
- * 引用语法（reference-grammar）守卫，以及拒绝（refusal）映射。机密值只单向流动——
- * 本类的任何方法都不会返回机密值。
+ * Host service backing the generated `ctx.remote.credentials` namespace. It
+ * carries every wire obligation the credential seam itself does not: the batch
+ * fan-out bound, the field-by-field view projection, the reference-grammar
+ * guard, and the refusal mapping. Full secret values cross in one direction only —
+ * no method here returns one.
  */
 export class CredentialsController extends TypertRemoteService {
   /** @param ctx - 可能挂载凭据提供方的宿主上下文。 */

@@ -18,13 +18,9 @@ import commandsRemote from '@deepseek-ai/dsh-commands/remote'
 import agentTeamsRemote from '@deepseek-ai/dsh-agent-team/remote'
 // 其类型面同时导出。
 export type {} from '@deepseek-ai/dsh-agent-team/remote'
-// 账号控制远端。
-import accountRemote from '@deepseek-ai/dsh-api-account-controller/remote'
-// 设置控制远端。
+import accountRemote from '@deepseek-ai/dsh-deepseek-account/remote'
 import settingsControllerRemote from '@deepseek-ai/dsh-api-settings-controller/remote'
-// Office 转 PDF 远端。
-import officeToPdfRemote from '@deepseek-ai/dsh-office-to-pdf/remote'
-// 目标（goal）远端。
+import officeKitRemote from '@deepseek-ai/dsh-office-kit/remote'
 import goalsRemote from '@deepseek-ai/dsh-goal/remote'
 // 计划任务（schedule）远端。
 import scheduleRemote from '@deepseek-ai/dsh-schedule/remote'
@@ -103,10 +99,10 @@ export type {} from '@deepseek-ai/dsh-user-questions/remote'
 export type {} from '@deepseek-ai/dsh-commands/remote'
 export type {} from '@deepseek-ai/dsh-web/remote'
 export type {} from '@deepseek-ai/dsh-api-settings-controller/remote'
-export type {} from '@deepseek-ai/dsh-api-account-controller/remote'
+export type {} from '@deepseek-ai/dsh-deepseek-account/remote'
 export type {} from '@deepseek-ai/dsh-goal/remote'
 export type {} from '@deepseek-ai/dsh-schedule/remote'
-export type {} from '@deepseek-ai/dsh-office-to-pdf/remote'
+export type {} from '@deepseek-ai/dsh-office-kit/remote'
 export type {} from '@deepseek-ai/dsh-llm/remote'
 export type {} from '@deepseek-ai/dsh-host-plugin-inventory/remote'
 export type {} from '@deepseek-ai/dsh-message-feedback/remote'
@@ -273,7 +269,7 @@ export async function apply(ctx: Context): Promise<() => Promise<void>> {
       messageFeedbackRemote, sessionFeedbackRemote,
       fileUploadsRemote, sessionReferencesRemote,
       permissionPresetsRemote, subagentsRemote, sessionRemote, jobRemote, workspaceRemote, workspaceFilesRemote, terminalRemote,
-      officeToPdfRemote, userQuestionsRemote, webRemote,
+      officeKitRemote, userQuestionsRemote, webRemote,
     ]) {
       // 挂载并记录其卸载函数。
       disposers.push(await ctx.remote.$mount(contribution))

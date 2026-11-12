@@ -461,8 +461,7 @@ function assertSourceEventReferences(
 // 用不可变的历史请求头解析工具新增声明的合法性。
 function assertDeveloperHeader(
   event: SessionEvent,
-  events: readonly SessionEvent[],
-  baseSeq: SessionLogOffset,
+  read: (seq: number) => SessionEvent | undefined,
 ): void {
   // 只针对 developer/message。
   if (event.type !== 'developer/message') return
@@ -471,8 +470,7 @@ function assertDeveloperHeader(
   // 未引用头部：无需进一步校验。
   if (event.data.headerSeq === undefined) return
   const headerSeq = event.data.headerSeq
-  // 按绝对序号定位头部事件。
-  const headerEvent = events[headerSeq - baseSeq]
+  const headerEvent = read(headerSeq)
   if (headerSeq >= event.seq || headerEvent?.type !== 'request/header') {
     // 必须引用更早的 request/header。
     throw new Error('developer/message headerSeq must reference an earlier request/header')
@@ -573,8 +571,7 @@ function isDeepEqualJson(a: unknown, b: unknown): boolean {
 function assertToolResultRewrite(
   event: SessionEvent,
   shadowedSeqs: readonly SessionSeq[],
-  events: readonly SessionEvent[],
-  baseSeq: SessionLogOffset,
+  read: (seq: number) => SessionEvent | undefined,
 ): void {
   // 只针对 tool/result。
   if (event.type !== 'tool/result') return
@@ -583,8 +580,7 @@ function assertToolResultRewrite(
     throw new Error('tool/result surface replacement must rewrite exactly one current node')
   }
   for (const originalSeq of shadowedSeqs) {
-    // 被替换目标必须是现有的 tool/result。
-    const original = events[originalSeq - baseSeq]
+    const original = read(originalSeq)
     if (original?.type !== 'tool/result') {
       throw new Error('tool/result surface replacement must target a current tool/result')
     }
@@ -616,13 +612,11 @@ function assertSystemHeadRewrite(
   state: SurfaceFoldState,
   startIdx: number,
   shadowedSeqs: readonly SessionSeq[],
-  events: readonly SessionEvent[],
-  baseSeq: SessionLogOffset,
+  read: (seq: number) => SessionEvent | undefined,
 ): void {
   // 只关心覆盖 node 0 的替换。
   if (startIdx !== 0) return
-  // node 0 不是 system/message：无需保护。
-  const head = events[state.nodes[0] as number - baseSeq]
+  const head = read(state.nodes[0] as number)
   if (head?.type !== 'system/message') return
   if (event.type !== 'system/message' || shadowedSeqs.length !== 1) {
     // 系统提示词保护：只允许同类型的 system/message 恰好替换该节点。
@@ -638,6 +632,7 @@ function planSurfaceEvent(
   events: readonly SessionEvent[],
   baseSeq: SessionLogOffset,
   projections: readonly SessionMessageProjection[],
+  candidates?: readonly SessionEvent[],
 ): SurfacePlan | undefined {
   if (event.seq !== expectedSeq) {
     // 序号必须连续（fail-closed 的日志完整性检查）。
@@ -645,13 +640,19 @@ function planSurfaceEvent(
   }
   // 校验 surface 元数据与开发者头部引用。
   const surfaceOp = validateSurfaceMetadata(event)
-  assertDeveloperHeader(event, events, baseSeq)
-  // 优先匹配插件消息投影定义。
+  const read = (seq: number): SessionEvent | undefined => {
+    const index = seq - baseSeq
+    return index < events.length ? events[index] : candidates?.[index - events.length]
+  }
+  assertDeveloperHeader(event, read)
   const projection = projections.find(item => item.type === event.type)
   if (projection !== undefined) {
-    // 投影路径：交给定义的纯解释器（携带当前历史）。
+    let projectionEvents: readonly SessionEvent[] | undefined
     return { kind: 'project', projection, messages: projection.project(event, {
-      nodes: state.nodes, events, baseSeq, messages: state.projectedMessages,
+      nodes: state.nodes,
+      get events() { return candidates === undefined ? events : (projectionEvents ??= [...events, ...candidates]) },
+      baseSeq,
+      messages: state.projectedMessages,
     }) }
   }
   if (MESSAGE_PROJECTION_EVENT_TYPES.has(event.type)) {
@@ -667,8 +668,8 @@ function planSurfaceEvent(
   // 替换转移：定位区间并依次跑三组约束校验。
   const range = replacementRange(state, surfaceOp)
   assertSourceEventReferences(event, range.shadowedSeqs)
-  assertToolResultRewrite(event, range.shadowedSeqs, events, baseSeq)
-  assertSystemHeadRewrite(event, state, range.startIdx, range.shadowedSeqs, events, baseSeq)
+  assertToolResultRewrite(event, range.shadowedSeqs, read)
+  assertSystemHeadRewrite(event, state, range.startIdx, range.shadowedSeqs, read)
   return {
     kind: 'replace',
     seq: event.seq,
@@ -793,6 +794,46 @@ export class SurfaceManager implements SessionSurface {
       event,
       expectedSeq,
       plan: planSurfaceEvent(this._state, event, expectedSeq, this.log, this.baseSeq, this.projections),
+    }
+  }
+
+  /**
+   * Validate consecutive candidates against an isolated surface fold.
+   * @param events - candidates immediately following the committed log.
+   * @returns a callback adopting the validated fold after all candidates enter the log.
+   */
+  prepareBatch(events: readonly SessionEvent[]): () => void {
+    this._assertProjections()
+    if (this._lastProcessedSeq < this.baseSeq + this.log.length - 1) this._processDelta()
+    const lastProcessedSeq = SessionSeq(this.baseSeq + this.log.length + events.length - 1)
+    if (events.every(event => (event.surfaceOp === undefined || event.surfaceOp === 'append')
+      && !this.projections.some(projection => projection.type === event.type))) {
+      const plans = events.map((event, index) => planSurfaceEvent(
+        this._state, event, SessionSeq(this.baseSeq + this.log.length + index), this.log, this.baseSeq, this.projections, events,
+      ))
+      return () => {
+        for (const plan of plans) applySurfacePlan(this._state, plan)
+        this._lastProcessedSeq = lastProcessedSeq
+        this._pendingPlan = undefined
+      }
+    }
+    const state: SurfaceFoldState = {
+      ...this._state,
+      nodes: [...this._state.nodes],
+      projectedMessages: new Map(this._state.projectedMessages),
+      projections: new Set(this._state.projections),
+    }
+    const plans = events.map((event, index) => {
+      const plan = planSurfaceEvent(
+        state, event, SessionSeq(this.baseSeq + this.log.length + index), this.log, this.baseSeq, this.projections, events,
+      )
+      applySurfacePlan(state, plan)
+      return plan
+    })
+    return () => {
+      for (const plan of plans) applySurfacePlan(this._state, plan)
+      this._lastProcessedSeq = lastProcessedSeq
+      this._pendingPlan = undefined
     }
   }
 

@@ -673,14 +673,8 @@ export class AgentLoop extends Service implements AgentFactory {
     // 普通对象里的工厂上下文。
     const loopCtx = this.runtime.ctx
 
-    // Deactivation fuses three owners, each with its own reason: the caller's
-    // cancellation signal, the owner fiber's unload, and factory teardown.
-    // It is registered BEFORE any resource exists, over mutable slots, so an
-    // unload arriving while the scope is still minting finds a working
-    // disposer instead of a leak.
-    // 失活信号融合三个所有者，各带自己的原因：调用方取消信号、owner fiber 卸载、工厂拆除。
-    // 它在任何资源存在之前、基于可变槽位注册——这样作用域还在铸造途中到来的卸载
-    // 也能找到可用的拆除器，而不是泄漏。
+    // The caller's signal governs creation. Owner disposal and factory
+    // shutdown can end the Agent's lifetime both during and after creation.
     const abort = new AbortController()
     // 调用方信号触发时的回调：把原因规整为 Error 后融进 abort。
     const onCallerAbort = (): void => {
@@ -743,7 +737,12 @@ export class AgentLoop extends Service implements AgentFactory {
         /* v8 ignore next -- setup failure untracks this disposer before resolving without a machine. */
         // 驱动器存在：以 disposed 取消主循环（未就绪则保留收件箱），等它完全空闲。
         if (machine !== undefined) {
-          machine.cancel({ kind: 'disposed' }, { keepInbox: !ready })
+          try {
+            machine.cancel({ kind: 'disposed' }, { keepInbox: !ready })
+          } catch (error: unknown) {
+            failures.push(error)
+          }
+          // A failed queue write must not release resources underneath work.
           await machine.whenIdle()
         }
       } catch (error: unknown) {
@@ -820,7 +819,7 @@ export class AgentLoop extends Service implements AgentFactory {
         const created = machine = new ReactLoopAgent(
           loopCtx, id, agentOptions, session,
           projections,
-          lastTurn,
+          lastTurn, abort.signal,
         )
         // 解除"machine 未就绪"栅栏。
         machineReady.resolve()
@@ -907,7 +906,7 @@ export class AgentLoop extends Service implements AgentFactory {
           assertLive()
           // 标记就绪：此后拆除不再保留收件箱输入。
           ready = true
-          // 发布完成：返回智能体与其共享拆除器。
+          callerSignal?.removeEventListener('abort', onCallerAbort)
           return { agent, dispose }
         } catch (error: unknown) {
           // Failed initialization must not release queued input into a new turn.

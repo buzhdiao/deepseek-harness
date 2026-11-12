@@ -30,7 +30,7 @@ import { assertSupportedJsonSchema } from './json-schema.ts'
 import { RUN_CODE_NAME, ToolActivationError } from './contracts.ts'
 // 工具契约类型全集。
 import type {
-  ToolDefinition, ToolRestriction, ToolExecution, ToolGuard,
+  ToolDefinition, ToolRestriction, ToolExecution, ToolGuard, ToolGuardDenial,
   ResolvedToolSet, ToolActivationContext, ToolRegistrationOptions,
 } from './contracts.ts'
 
@@ -493,14 +493,13 @@ export class ToolsService extends Service {
   /**
    * Check global and inherited guards after pre-execute policy and approval resolve.
    * @param exec - invocation whose guards are checked before dispatch.
-   * @returns the first denial reason, or undefined when no guard denies.
+   * @returns the first denial with its optional structured identity, or undefined when no guard denies.
    */
-  checkGuards(exec: ToolExecution): string | undefined {
-    // 全局 + 继承作用域层逐一求值守卫；返回首个拒绝理由。
+  checkGuards(exec: ToolExecution): ToolGuardDenial | undefined {
     for (const layer of [this.guards.global, ...this.guards.chainLayers(exec.agent)]) {
       for (const guard of layer.guards.values()) {
-        const reason = guard(exec)
-        if (reason !== undefined) return reason
+        const denial = guard(exec)
+        if (denial !== undefined) return typeof denial === 'string' ? { reason: denial } : denial
       }
     }
     // 无守卫拒绝。

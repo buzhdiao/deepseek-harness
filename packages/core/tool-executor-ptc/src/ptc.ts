@@ -10,25 +10,25 @@
 // 3. 语言感知 schema：description 与参数描述经 getter 在投影时按运行时语言解析，
 //    而参数校验始终锚定语言无关的静态 spec。
 /**
- * PTC mode `run_code` transport. Programs call the registry's agent-visible
- * tools through nested executions scheduled under the native concurrency
- * contract; each sub-dispatch is logged for reconstruction, while only the
- * outer curated result enters model history.
+ * Shared program transport. Programs call their admitted tools through nested
+ * executions scheduled under the native concurrency contract; each sub-dispatch
+ * is logged for reconstruction, while only the outer curated result enters model
+ * history.
  * @module
  */
 
-// 分发日志条目类型（记录子调用的内容块）。
+import { isDeepStrictEqual } from 'node:util'
 import type { PtcDispatchLog } from './runtime-types.ts'
 // cordis 的 symbols（含 original 包装穿透标记）与 Context 类型。
 import { symbols, type Context } from '@deepseek-ai/cordis'
 // brandString：把字符串收窄为品牌类型（如 ToolCallId）。
 import { brandString } from '@deepseek-ai/dsh-brand'
-// createUserMessage：构造延迟注入的上下文消息；HarnessError：harness 级错误类型。
-import { createUserMessage, HarnessError } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, HarnessError, resolveImageAttachmentAccess } from '@deepseek-ai/dsh-llm'
 
 // LLM 线上类型：内容块、工具调用 id、工具 schema。
 import type { ContentBlock, ToolCallId, ToolSchema } from '@deepseek-ai/dsh-llm'
-// PTC 运行时类型：绑定函数、运行结果、沙箱信息、运行时接口。
+import { PtcImage } from '@deepseek-ai/dsh-ptc-runtime'
+import type { PtcOutput } from '@deepseek-ai/dsh-ptc-runtime'
 import type { PtcBindingFunction, PtcRunResult, PtcRunSandbox, PtcRuntime } from '@deepseek-ai/dsh-ptc-runtime'
 // 沙箱升级：审批执行、升级目标集合、升级参数校验。
 import { approveEscalation, ESCALATION_TARGETS, validateEscalationArgs } from '@deepseek-ai/dsh-sandbox'
@@ -40,9 +40,7 @@ import type {} from '@deepseek-ai/dsh-working-directory'
 import type {} from '@deepseek-ai/dsh-sandbox-policy'
 // 值工具：深冻结、无损 JSON 快照与 JsonValue 类型。
 import { deepFreeze, snapshotJsonValue, type JsonValue } from '@deepseek-ai/dsh-util-values'
-// 工具原语：定义工具、参数 spec -> JSON Schema 投影、保留工具名、中止错误码。
-import { defineTool, parameterSchemaSpecToJsonSchema, RUN_CODE_NAME, TOOL_ABORTED } from '@deepseek-ai/dsh-tools'
-// 工具执行管线的类型与错误消息格式化。
+import { defineTool, parameterSchemaSpecToJsonSchema, projectToolSchema, RUN_CODE_NAME, TOOL_ABORTED } from '@deepseek-ai/dsh-tools'
 import type { ToolExecutionPipeline } from '@deepseek-ai/dsh-tools/pipeline'
 import { toolErrorMessage } from '@deepseek-ai/dsh-tools/pipeline'
 // scopeTarget：按智能体圈定作用域监听目标。
@@ -53,9 +51,8 @@ import type { PtcCalls } from './ptc-calls.ts'
 import { CodeRunFailedError, ToolCallLimitExceededError } from './errors.ts'
 // 已校验的配置类型。
 import type { Config } from './config.ts'
-// 工具核心类型：工具定义、执行结果、运行上下文。
-import type { ToolDefinition, ToolExecutionResult, ToolRunContext } from '@deepseek-ai/dsh-tools'
-// 副作用导入：引入 types.ts 的模块扩充。
+import type { RunCodeToolOptions } from './run-code.ts'
+import type { ToolDefinition, ToolExecution, ToolExecutionFailure, ToolExecutionResult, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type {} from './types.ts'
 
 /** The model-facing name of the PTC mode tool. */
@@ -74,11 +71,8 @@ interface RunCodeFlavor {
 }
 
 /** Keep tool-call rules here; the runtime owns evaluation syntax and state retention. */
-// 工具调用规则集中在此；运行时只负责求值语法与状态保留。
-// language 为语言名；execution 覆盖默认的程序描述/输出指令/参数描述（默认参数对象）。
-function runCodeFlavor(language: string, execution = {
+function runCodeFlavor(language: string, outputInstruction: string, execution = {
   programDescription: 'the program to execute',
-  outputInstruction: 'Curate the program output.',
   codeDescription: `The ${language} program to execute, following this tool's execution instructions.`,
 }): RunCodeFlavor {
   // 组装该语言风味的工具描述与 code 参数描述（运行期消费的字符串模板）。
@@ -86,21 +80,18 @@ function runCodeFlavor(language: string, execution = {
     description: `Execute a ${language} program against the available tools. Takes two required arguments: `
       + `\`code\`, ${execution.programDescription}, and \`description\`, a short summary of what the program does. `
       + 'Call tools as `await tools.name(args)` per the declarations in the system prompt. '
-      + `${execution.outputInstruction} Image-bearing subtool results are attached after the run.`,
+      + outputInstruction,
     codeDescription: execution.codeDescription,
   }
 }
 
-// TypeScript 整文件程序的默认风味。
-const TYPESCRIPT_FLAVOR = runCodeFlavor('TypeScript')
-// TypeScript 函数体程序的风味：code 参数是 async 函数体（仅可擦除语法）。
-const TYPESCRIPT_FUNCTION_FLAVOR = runCodeFlavor('TypeScript', {
+const TYPESCRIPT_OUTPUT_INSTRUCTION = 'Show selected text and images with inspect(...values).'
+const TYPESCRIPT_FLAVOR = runCodeFlavor('TypeScript', TYPESCRIPT_OUTPUT_INSTRUCTION)
+const TYPESCRIPT_FUNCTION_FLAVOR = runCodeFlavor('TypeScript', TYPESCRIPT_OUTPUT_INSTRUCTION, {
   programDescription: 'the BODY of an async function (erasable syntax only; top-level `await` and `return` work)',
-  outputInstruction: 'Only what you print or return is program output — curate it.',
   codeDescription: 'The program: the body of an async TypeScript function.',
 })
-// Python 风味。
-const PYTHON_FLAVOR = runCodeFlavor('Python')
+const PYTHON_FLAVOR = runCodeFlavor('Python', 'Curate the program output. Image-bearing subtool results are attached after the run.')
 
 /** Languages with both a transport schema and an SDK renderer. */
 // 同时拥有传输 schema 与 SDK 渲染器的语言集合。
@@ -127,7 +118,11 @@ export function requirePtcRuntime(ctx: Context): SupportedPtcRuntime {
   if (runtime === undefined) {
     throw new Error('dsh-tools: mode "ptc" requires a PTC runtime — load a ctx.ptcRuntime implementation (e.g. @deepseek-ai/dsh-ptc-runtime-node) or load @deepseek-ai/dsh-tool-executor-native')
   }
-  // 语言没有注册 SDK 渲染器：报错并列出已知语言。
+  return requireRuntimeLanguage(runtime)
+}
+
+/** Resolve the SDK flavor for a mounted or explicitly supplied provider. */
+function requireRuntimeLanguage(runtime: PtcRuntime): SupportedPtcRuntime {
   if (!Object.hasOwn(RUN_CODE_FLAVORS, runtime.language)) {
     const known = Object.keys(RUN_CODE_FLAVORS).map(name => JSON.stringify(name)).join(', ')
     throw new Error(`dsh-tools: no SDK renderer registered for runtime language ${JSON.stringify(runtime.language)} (known: ${known})`)
@@ -337,6 +332,33 @@ function renderValue(value: JsonValue): string {
 // 外层 PTC 模式传输返回的规范值：日志、可选结果值、可选沙箱信息。
 type RunCodeOutput = { logs: string[]; result?: JsonValue; sandbox?: PtcRunSandbox }
 
+/** Render captured text, selected images, and the applied file policy in emission order. */
+function renderRunOutput(
+  value: RunCodeOutput,
+  guidance: string,
+  output: PtcOutput[] = value.logs.map(text => ({ type: 'text', text })),
+  toolName: string,
+): ContentBlock[] {
+  const content: ContentBlock[] = []
+  const appendText = (text: string): void => { if (text.length > 0) content.push({ type: 'text', text }) }
+  const remaining: string[] = []
+  for (const block of output) {
+    if (block.type === 'text') remaining.push(block.text)
+    else {
+      appendText(remaining.join(''))
+      remaining.length = 0
+      content.push(block)
+    }
+  }
+  appendText(remaining.join(''))
+  const details: string[] = []
+  if (value.result !== undefined) details.push(renderValue(value.result))
+  if (value.sandbox?.enforcement === 'partial') details.push('File sandbox enforcement is partial on this host.')
+  if (value.sandbox?.denied) details.push(`The ${value.sandbox.mode} file sandbox denied an operation.${guidance}`)
+  appendText(details.filter(text => text.length > 0).join('\n'))
+  return content.length > 0 ? content : [{ type: 'text', text: `(${toolName} completed with no output)` }]
+}
+
 /** Unowned programs do not require Session directory state. */
 // 解析工作目录：无主（无 Agent）的程序不需要会话目录状态，返回 undefined。
 async function resolveWorkingDirectory(ctx: Context, exec: ToolRunContext): Promise<string | undefined> {
@@ -359,21 +381,25 @@ function resolveSandboxPolicy(ctx: Context, exec: ToolRunContext): SandboxExecut
 }
 
 /**
- * Build the reserved `run_code` transport outside registered capabilities.
+ * Build a program transport using the shared nested-call scheduler.
  * @param ctx - executor context owning policy listeners and active program cleanup.
  * @param executor - shared invocation pipeline for nested calls.
  * @param config - validated timeout-based tool-call allowance and concurrency limits.
  * @param calls - Executor-owned cancellation and reset coordination.
+ * @param options - Fixed runtime and tools for a registered program tool; omission selects PTC's visible registry and current runtime.
  * @returns the transport definition with runtime-dependent schema text.
  */
-export function createRunCodeTool(
+export function createRunCodeTransport(
   ctx: Context,
   executor: ToolExecutionPipeline,
   config: Config,
   calls: PtcCalls,
+  options?: Omit<RunCodeToolOptions, 'limits'>,
 ): ToolDefinition {
   // 解构配置：每分钟子调用配额与并行子调用上限。
   const { maxSubCallsPerMinute, maxParallelSubCalls: maxParallel } = config
+  const toolName = options?.name ?? RUN_CODE_NAME
+  const getRuntime = options === undefined ? () => requirePtcRuntime(ctx) : () => requireRuntimeLanguage(options.runtime)
   // Retain services for log settlement after the executor context becomes inactive.
   // 提前保留服务引用：执行器上下文失活后仍要完成日志落定。
   const tools = ctx.tools
@@ -395,12 +421,24 @@ export function createRunCodeTool(
     }
   }
 
-  // 每个 Agent 到其已注册"运行时释放 effect"的原始 provider 集合（WeakMap 防泄漏）。
+  type ImageRef = Extract<ContentBlock, { type: 'image' }>['attachment']
+  const inspections = new WeakMap<ToolExecution, {
+    value?: RunCodeOutput
+    failure?: Pick<ToolExecutionFailure, 'error' | 'content'>
+    output: PtcOutput[]
+  }>()
+  const programImage = (ref: ImageRef): PtcImage => {
+    const attachments = ctx.get('attachments')
+    const fs = ctx.get('fs')
+    const access = attachments === undefined || fs === undefined ? undefined
+      : resolveImageAttachmentAccess(attachments, path => fs.processPathFromHostPath(path), ref)
+    if (access === undefined) throw new Error('Image storage must expose a readable path in the program filesystem')
+    return new PtcImage(access.readonlyPath, ref)
+  }
   const stateOwners = new WeakMap<object, WeakSet<PtcRuntime>>()
   // 用 defineTool 组装保留的 run_code 工具定义。
   const definition = defineTool({
-    // 保留工具名。
-    name: RUN_CODE_NAME,
+    name: toolName,
     // The description and `code` parameter description are placeholders here:
     // the language-aware getters installed below replace both, resolving the
     // loaded runtime's flavor at schema-emission time so the schema the MODEL
@@ -448,19 +486,8 @@ export function createRunCodeTool(
           },
         },
       },
-      // 结果渲染器：把日志、结果值与沙箱提示拼成模型可见文本。
-      render: (_args, value) => {
-        // 结果值在场才渲染。
-        const rendered = value.result === undefined ? '' : renderValue(value.result)
-        // 非空部分列表：日志 + 渲染结果。
-        const parts = [value.logs.join('\n'), rendered].filter(part => part.length > 0)
-        // 本机强制不完整：提示模型。
-        if (value.sandbox?.enforcement === 'partial') parts.push('File sandbox enforcement is partial on this host.')
-        // 操作被拒：附拒绝说明与升级指引。
-        if (value.sandbox?.denied) parts.push(`The ${value.sandbox.mode} file sandbox denied an operation.${escalationGuidance(ctx.get('ptcRuntime')?.sandboxMode)}`)
-        // 全空则给出固定的"无输出"占位。
-        return [{ type: 'text', text: parts.length > 0 ? parts.join('\n') : '(run_code completed with no output)' }]
-      },
+      render: (_args, value) => renderRunOutput(value,
+        escalationGuidance(options === undefined ? ctx.get('ptcRuntime')?.sandboxMode : options.runtime.sandboxMode), undefined, toolName),
     },
     // 工具执行入口。
     async execute(args, exec): Promise<RunCodeOutput> {
@@ -468,9 +495,7 @@ export function createRunCodeTool(
       if (args.description.trim().length === 0) {
         throw new Error('invalid description: expected a non-empty string')
       }
-      // 取受支持的 PTC 运行时。
-      const runtime = requirePtcRuntime(ctx)
-      // 单次程序执行体：callSignal 为本次调用的取消信号。
+      const runtime = getRuntime()
       const run = async (callSignal: AbortSignal): Promise<RunCodeOutput> => {
         // 校验升级参数的配对合法性与长度。
         validateEscalationArgs(args.sandbox_permissions, args.justification)
@@ -497,7 +522,7 @@ export function createRunCodeTool(
             subject: 'program',
           }, {
             approver: ctx.get('approval'), agent: exec.agent, callId: exec.callId,
-            toolName: RUN_CODE_NAME, signal: callSignal,
+            toolName, signal: callSignal,
           })
           // 审批通过：以批准的模式覆盖常设策略的模式。
           policy = { ...standingPolicy, mode: approvedMode }
@@ -695,16 +720,16 @@ export function createRunCodeTool(
         // 绑定函数工厂：把一个工具 schema 变成程序可调用的绑定。
         const binding = (schema: ToolSchema): PtcBindingFunction => async (rawArgs: unknown): Promise<JsonValue> => {
           const { name } = schema
-          // run 已结束：直接拒绝分发。
+          // FIXME: Let image-producing tools declare their program result adaptation.
+          const usesProgramImage = runtime.language === 'typescript' && (name === 'read_image' || name === 'cua')
           if (runOver()) {
-            throw new Error(`run_code run is over (${String(runController.signal.reason)}); ${name} not dispatched`)
+            throw new Error(`${toolName} run is over (${String(runController.signal.reason)}); ${name} not dispatched`)
           }
           // Count before validation and queuing so repeated failed calls also exhaust the allowance.
           // 在校验与排队之前计数：反复失败的调用同样耗尽配额。
           const n = ++toolCallAttempts
           if (n > maxSubCalls) {
-            // 超限：构造错误、中止整个 run、抛给程序。
-            const error = new ToolCallLimitExceededError(maxSubCalls, n, maxSubCallsPerMinute)
+            const error = new ToolCallLimitExceededError(maxSubCalls, n, maxSubCallsPerMinute, toolName)
             runController.abort(error)
             throw error
           }
@@ -726,17 +751,15 @@ export function createRunCodeTool(
             // 子执行监听 run 级取消信号。
             signal: runController.signal,
           }
-          // 绑定调用的结局：错误消息或结果值。
-          type DispatchOutcome = { isError: true; message: string } | { isError: false; value: JsonValue }
-          // 分发 promise：等排队/启动/提交完成后 resolve。
+          type DispatchOutcome = { isError: true; message: string }
+            | { isError: false; value: JsonValue; content: ContentBlock[]; imageRemoved: boolean }
           const outcome = await new Promise<DispatchOutcome>((resolve, reject) => {
             // Set by the dispatch stage (or start() for a pre-settled result): what commit() finalizes in submission order.
             // 由分发阶段（或 start() 的预定结果）设置：commit() 按提交顺序收尾的对象。
             let parked:
               | { kind: 'post-result' | 'final-result'; exec: ToolRunContext; result: ToolExecutionResult }
               | undefined
-            // settle：立即把值交给程序，并把事件追加记为附带工作。
-            const settle = (result: ToolExecutionResult): void => {
+            const settle = (result: ToolExecutionResult, imageRemoved: boolean): void => {
               // The program gets its value NOW: the log-content listener (for
               // example, a spill backend) must never delay the binding or occupy
               // a dispatch slot. The event append is tracked side work; the run's
@@ -749,8 +772,7 @@ export function createRunCodeTool(
               // （shapeDispatchLog 被容住，该链不会 reject）。
               resolve(result.isError
                 ? { isError: true, message: result.error.message }
-                : { isError: false, value: result.value })
-              // 无主调用没有会话可记录。
+                : { isError: false, value: result.value, content: result.content, imageRemoved })
               const agent = exec.agent
               if (agent === undefined) return
               // 附带任务：整形日志内容并追加 settle 事件。
@@ -800,8 +822,7 @@ export function createRunCodeTool(
               // 未声明/非法时 fail-closed 为 exclusive。
               classify: () => executor.executionMode(input).kind,
               abandon: () => {
-                // run 已结束：以拒绝收场。
-                reject(new Error(`run_code run is over (${String(runController.signal.reason)}); ${name} tool call abandoned`))
+                reject(new Error(`${toolName} run is over (${String(runController.signal.reason)}); ${name} tool call abandoned`))
               },
               async start(): Promise<void> {
                 // 有序阶段第一步：追加分发开始事件。
@@ -835,8 +856,7 @@ export function createRunCodeTool(
                 if (parked === undefined) return
                 // 有序阶段：执行完整完成管线（post-execute 等）。
                 const result = await executor.complete(parked.exec, parked)
-                // 成功且含图像的子结果：作为延迟上下文消息注入，供下一步查看。
-                if (!result.isError && result.content.some(block => block.type === 'image')) {
+                if (!usesProgramImage && !result.isError && result.content.some(block => block.type === 'image')) {
                   exec.deferContext(createUserMessage({
                     content: result.content,
                     source: { kind: 'ptc-mode' },
@@ -855,8 +875,8 @@ export function createRunCodeTool(
                 // 只有成功的嵌套结果能携带终止标记（ToolExecutionFailure
                 // 类型永不携带），策略转换出的失败无法借恢复中的程序终止轮次。
                 if (result.concludesTurn) exec.concludeTurn()
-                // 把结果交给程序（settle）。
-                settle(result)
+                settle(result, parked.result.content.some(block => block.type === 'image')
+                  && !result.content.some(block => block.type === 'image'))
                 // Backpressure on pending event-append tasks: each task retains
                 // a full result while a slow backend stores it, so the pool cap
                 // bounds their count. Beyond the cap, the
@@ -878,7 +898,7 @@ export function createRunCodeTool(
           // 本调用在途期间发生的预算到期或外层取消已经中止了该分发；
           // 现在就停程序，而不是把已结束 run 的结果递给它。
           if (runOver()) {
-            throw new Error(`run_code run is over (${String(runController.signal.reason)}); ${name} result discarded`)
+            throw new Error(`${toolName} run is over (${String(runController.signal.reason)}); ${name} result discarded`)
           }
           // The worker turns a binding rejection into ToolCallError and adds
           // only the binding name. Native content and internal error metadata
@@ -886,7 +906,16 @@ export function createRunCodeTool(
           // worker 侧把绑定拒绝转成 ToolCallError，只附加绑定名。
           // 原生内容与内部错误元数据不进入程序侧的失败契约。
           if (outcome.isError) throw new Error(outcome.message)
-          // 成功：把值交给程序。
+          if (usesProgramImage) {
+            const images = outcome.content.filter(block => block.type === 'image')
+            const first = images[0]
+            if (first !== undefined && images.length === 1) return programImage(first.attachment)
+            if (outcome.imageRemoved) {
+              throw new Error('Image output was removed by a tool output policy.\n'
+                + outcome.content.filter(block => block.type === 'text').map(block => block.text).join('\n'))
+            }
+            if (name === 'read_image' || images.length > 1) throw new Error('Image-producing tools must return exactly one image')
+          }
           return outcome.value
         }
 
@@ -899,15 +928,11 @@ export function createRunCodeTool(
         // 的注册工具必须成为普通自有键（普通对象赋值会命中原型 setter，静默
         // 丢掉绑定），且运行时宿主只按自有属性解析绑定名。
         const functions: Record<string, PtcBindingFunction> = Object.create(null) as Record<string, PtcBindingFunction>
-        // Enumerate the CALLING AGENT's visible set (scoped tools join,
-        // restricted globals vanish) — the same view the SDK section declared,
-        // so a program can bind exactly what its prompt promised; sub-dispatch
-        // re-resolves per call through the same view (exec.agent threads down).
-        // 枚举"调用方智能体"的可见集（作用域内工具加入、受限全局消失）——
-        // 与 SDK 段声明的视图相同，程序能绑定的恰是其提示词承诺的内容；
-        // 子分发经同一视图逐调用再解析（exec.agent 一路下传）。
-        for (const schema of tools.schemas(exec.agent, exec.toolSet)) {
-          // 深冻结 schema 后为每个可见工具安装绑定。
+        // PTC uses step-admitted registry tools; a registered program tool uses
+        // only its private definitions, resolved by its own pipeline on each call.
+        const schemas = options === undefined ? tools.schemas(exec.agent, exec.toolSet)
+          : options.tools.map(definition => projectToolSchema(definition, true))
+        for (const schema of schemas) {
           Object.defineProperty(functions, schema.name, { enumerable: true, value: binding(deepFreeze(schema)) })
         }
 
@@ -939,6 +964,7 @@ export function createRunCodeTool(
             // 取消信号、目录、沙箱策略与超时。
             const spec = runtime.resolve({
               program: args.code,
+              ...runtime.language === 'typescript' ? { discardCompletion: true } : {},
               ...exec.agent === undefined || policy?.mode !== standingPolicy?.mode ? {} : { stateOwner: exec.agent },
               bindings: [{
                 global: 'tools',
@@ -960,42 +986,46 @@ export function createRunCodeTool(
             // Abort sub-dispatches and drain every in-flight dispatch before
             // closing the turn (queued-unstarted ones are abandoned unlogged).
             // Binding failures remain observable through their individual promises.
-            // 关闭轮次前：中止全部子分发并排空每个在途分发
-            // （排队未开始者被放弃、不留日志）。绑定失败仍可经各自的
-            // promise 观察。
-            runController.abort('run_code settled')
+            runController.abort(`${toolName} settled`)
             await drainDispatches()
           }
 
-          // 程序失败：分类转换成模型侧错误。
+          const logs = result.output.flatMap(block => block.type === 'text' ? [block.text] : [])
+          const hasImages = result.output.some(block => block.type === 'image')
           if (result.error) {
             // 若中止原因是配额超限，取出该错误。
             const limitError = runController.signal.reason instanceof ToolCallLimitExceededError
               ? runController.signal.reason : undefined
-            // 外层调用取消导致的 abort：转为标准 AbortError（保留状态时带消息）。
+            let failure: HarnessError
             if (result.error.kind === 'abort' && exec.signal.aborted && limitError === undefined) {
               const message = runtime.retainsState ? `tool call aborted: ${result.error.message}` : 'tool call aborted'
-              const error = new HarnessError(message, TOOL_ABORTED)
-              error.name = 'AbortError'
-              throw error
+              failure = new HarnessError(message, TOOL_ABORTED)
+              failure.name = 'AbortError'
+            } else {
+              const logsText = logs.length > 0 && !hasImages
+                ? `\nCaptured output:\n${logs.join('')}` : ''
+              const sandboxText = result.sandbox === undefined ? ''
+                : `${logsText.endsWith('\n') ? '' : '\n'}File sandbox: ${result.sandbox.mode}${result.sandbox.enforcement === undefined ? '' : `; enforcement: ${result.sandbox.enforcement}`}${result.sandbox.denied ? '; operation denied' : ''}.`
+              const failureText = limitError === undefined || limitError.message === result.error.message
+                ? result.error.message : `${limitError.message}\n${result.error.message}`
+              failure = new CodeRunFailedError(`code run failed (${result.error.kind}): ${failureText}${logsText}${sandboxText}${result.sandbox?.denied ? escalationGuidance(runtime.sandboxMode) : ''}`)
             }
-            // 捕获输出的文本块。
-            const logsText = result.logs.length > 0 ? `\nCaptured output:\n${result.logs.join('\n')}` : ''
-            // 沙箱状态文本块。
-            const sandboxText = result.sandbox === undefined ? ''
-              : `\nFile sandbox: ${result.sandbox.mode}${result.sandbox.enforcement === undefined ? '' : `; enforcement: ${result.sandbox.enforcement}`}${result.sandbox.denied ? '; operation denied' : ''}.`
-            // 失败文本：配额错误与运行错误都存在且消息不同时并列两者。
-            const failureText = limitError === undefined || limitError.message === result.error.message
-              ? result.error.message : `${limitError.message}\n${result.error.message}`
-            // 抛出结构化的代码运行失败。
-            throw new CodeRunFailedError(`code run failed (${result.error.kind}): ${failureText}${logsText}${sandboxText}${result.sandbox?.denied ? escalationGuidance(runtime.sandboxMode) : ''}`)
+            if (hasImages) inspections.set(exec, {
+              failure: {
+                error: { message: failure.message, info: { name: failure.name, code: failure.code } },
+                content: [{ type: 'text', text: `Error: ${failure.message}` }],
+              },
+              output: result.output,
+            })
+            throw failure
           }
-          // 成功：返回规范输出（logs 必有，sandbox/result 在场才带）。
-          return {
-            logs: result.logs,
+          const value: RunCodeOutput = {
+            logs,
             ...result.sandbox === undefined ? {} : { sandbox: result.sandbox },
-            ...result.value !== undefined ? { result: result.value } : {},
+            ...runtime.language !== 'typescript' && result.value !== undefined ? { result: result.value } : {},
           }
+          if (hasImages) inspections.set(exec, { value, output: result.output })
+          return value
         } finally {
           // 无论成败都移除外层取消桥接监听。
           callSignal.removeEventListener('abort', onOuterAbort)
@@ -1006,6 +1036,18 @@ export function createRunCodeTool(
       return exec.agent === undefined || (runtime.sandboxMode === undefined && !runtime.retainsState) ? run(exec.signal)
         : calls.run(exec.agent.session.id, exec.signal,
           () => runtime.sandboxMode === undefined ? undefined : resolveSandboxPolicy(ctx, exec).mode, run)
+    },
+    projectContent(exec, result) {
+      const selected = inspections.get(exec)
+      inspections.delete(exec)
+      if (selected === undefined) return undefined
+      if (result.isError) {
+        if (!isDeepStrictEqual(selected.failure, { error: result.error, content: result.content })) return undefined
+        return [...result.content, ...renderRunOutput({ logs: [] }, '', selected.output, toolName)]
+      }
+      if (selected.value === undefined || !isDeepStrictEqual(selected.value, result.value)) return undefined
+      return renderRunOutput(selected.value,
+        escalationGuidance(options === undefined ? ctx.get('ptcRuntime')?.sandboxMode : options.runtime.sandboxMode), selected.output, toolName)
     },
     // The model-authored description is the call's always-visible UI label
     // (the bash `description` precedent); the program itself rides rawInput.
@@ -1029,12 +1071,9 @@ export function createRunCodeTool(
     enumerable: true,
     // 语言感知的 description getter。
     get: () => {
-      // 每次读取都重新解析运行时。
-      const runtime = requirePtcRuntime(ctx)
-      // 运行时附加的执行指令。
+      const runtime = getRuntime()
       const instructions = runtime.executionInstructions
-      // 组装：风味描述 + 指令 + 固定目录说明 + 升级指引。
-      return resolveFlavor(runtime).description
+      return (options?.description ?? resolveFlavor(runtime).description)
         + (instructions ? ` ${instructions}` : '')
         + " Each program starts in the Session's current directory. Running programs keep their initial directory."
         + escalationGuidance(runtime.sandboxMode)
@@ -1048,8 +1087,7 @@ export function createRunCodeTool(
     // 经 defineTool 同一条 spec→schema 投影重新编译，
     // 保证发射的 schema 永远与校验用规范一致。
     get: () => {
-      const runtime = requirePtcRuntime(ctx)
-      // 按当前运行时风味重投影参数 schema。
+      const runtime = getRuntime()
       return parameterSchemaSpecToJsonSchema({
         code: { type: 'string', required: true, description: resolveFlavor(runtime).codeDescription },
         description: { type: 'string', required: true, description: RUN_CODE_DESCRIPTION_PARAM_DESCRIPTION },

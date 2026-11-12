@@ -107,9 +107,12 @@ export interface SessionSnapshot {
   readonly openError: RemoteFailure | null
   // 是否还有更早的历史未加载。
   readonly hasMore: boolean
-  // 是否正在加载更早历史（含回合跳转）。
+  /** This Client Session has exposed an incomplete history window; remains true across replacements. */
+  readonly historyWasPartial: boolean
+  /** Whether historyLoadStatus is loading, including Turn-jump requests. */
   readonly loadingOlder: boolean
-  // 最近一次发送/停止失败；无则为 null。
+  /** History request status; pendingConsumption retains an unpublished ordinary page. */
+  readonly historyLoadStatus: 'idle' | 'loading' | 'pendingConsumption' | 'error'
   readonly promptError: PromptError | null
   // 会话尚无任何消息（空白会话）。
   readonly blank: boolean

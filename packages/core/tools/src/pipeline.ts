@@ -25,7 +25,7 @@ import type {} from '@deepseek-ai/dsh-user-approval'
 import { assertNever, deepFreeze, snapshotJsonValue, type JsonValue } from '@deepseek-ai/dsh-util-values'
 // 契约常量与错误类：中止错误码（两种）、工具未找到、工具输出非法。
 import { TOOL_ABORTED, TOOL_ABORTED_BEFORE_DISPATCH, ToolNotFoundError, ToolOutputError } from './contracts.ts'
-// 输出 schema 值校验器。
+import { APPROVAL_CANCELLED, APPROVAL_ERROR_NAME, APPROVAL_REJECTED, APPROVAL_UNAVAILABLE, type ApprovalErrorCode } from './error-codes.ts'
 import { validateJsonSchemaValue } from './json-schema.ts'
 // 工具服务类型。
 import type { ToolsService } from './index.ts'
@@ -292,11 +292,9 @@ export class ToolExecutionPipeline {
       if (decision.kind === 'cancel') {
         return { kind: 'post-result', exec, result: toolAbortedBeforeDispatchResult() }
       }
-      // 允许时再跑注册表守卫；拒绝时用策略给的理由。
-      const denialReason = decision.kind === 'allow' ? this.tools.checkGuards(exec) : decision.reason
-      const denialInfo = decision.kind === 'deny' ? decision.info : undefined
-      if (denialReason !== undefined) {
-        // 守卫/策略拒绝：组装错误结果（post-result 仍走 post-execute）。
+      const denial = decision.kind === 'allow' ? this.tools.checkGuards(exec) : decision
+      if (denial !== undefined) {
+        const { reason: denialReason, info: denialInfo } = denial
         return {
           kind: 'post-result',
           exec,
@@ -345,6 +343,10 @@ export class ToolExecutionPipeline {
    * Dispatch the registered body with the original caller signal fused back
    * into any around-wrapper replacement. Cancellation never abandons the body:
    * a started promise reaches quiescence before its outcome becomes `ABORTED`.
+   * After cancellation, a thrown signal reason or an `Error` named
+   * `AbortError` without `HarnessError` identity keeps its message and gains
+   * the `ABORTED` identity, whichever operation inside the body aborted; a
+   * thrown `HarnessError` and any other failure stay unchanged.
    */
   private async dispatchToolBody(exec: MutableToolRunContext): Promise<ToolExecutionResult> {
     // 取回取消状态。
@@ -379,8 +381,9 @@ export class ToolExecutionPipeline {
         ? toolAbortedResult(result)
         : result
     } catch (error: unknown) {
-      // 工具或未知工具失败：转为错误结果（仍会走 post-execute）。
-      return toolErrorResult(error)
+      return isAborted(signal) && isUnclassifiedCancellation(error, signal)
+        ? toolErrorResult(error, { name: 'AbortError', code: TOOL_ABORTED })
+        : toolErrorResult(error)
     } finally {
       // 清理融合监听并还原信号槽位。
       fused.dispose()
@@ -558,7 +561,8 @@ export class ToolExecutionPipeline {
    * session to audit to and no UI to route to. Otherwise the outcome maps
    * one-to-one — `allowed-once` proceeds; the three non-grants deny with
    * distinct reasons so the model can tell a human "no" from an absent
-   * approval channel.
+   * approval channel. Every denial carries `ApprovalError` with
+   * `APPROVAL_REJECTED`, `APPROVAL_CANCELLED`, or `APPROVAL_UNAVAILABLE`.
    */
   private async serviceAsk(
     exec: ToolExecution,
@@ -568,15 +572,14 @@ export class ToolExecutionPipeline {
     const approval = this.ctx.get('approval')
     if (approval === undefined) {
       return {
-        // 无审批通道：退化为拒绝（保留策略给出的理由）。
-        decision: { kind: 'deny', reason: ask.reason ?? `tool "${exec.name}" requires approval (not yet supported)` },
+        decision: approvalDenial(ask.reason ?? `tool "${exec.name}" requires approval (not yet supported)`, APPROVAL_UNAVAILABLE),
         approvalCancelled: false,
       }
     }
     // 无 Agent 的执行同样退化：没有会话可审计、没有 UI 可路由。
     if (exec.agent === undefined) {
       return {
-        decision: { kind: 'deny', reason: `tool "${exec.name}" requires approval, but the call has no agent to route it through` },
+        decision: approvalDenial(`tool "${exec.name}" requires approval, but the call has no agent to route it through`, APPROVAL_UNAVAILABLE),
         approvalCancelled: false,
       }
     }
@@ -595,17 +598,17 @@ export class ToolExecutionPipeline {
       case 'allowed-once': return { decision: { kind: 'allow' }, approvalCancelled: false }
       // 用户拒绝：以可区分的理由拒绝。
       case 'rejected': return {
-        decision: { kind: 'deny', reason: `the user rejected tool "${exec.name}"` },
+        decision: approvalDenial(`the user rejected tool "${exec.name}"`, APPROVAL_REJECTED),
         approvalCancelled: false,
       }
       // 审批被取消：拒绝并标记审批通道取消。
       case 'cancelled': return {
-        decision: { kind: 'deny', reason: `approval for tool "${exec.name}" was cancelled` },
+        decision: approvalDenial(`approval for tool "${exec.name}" was cancelled`, APPROVAL_CANCELLED),
         approvalCancelled: true,
       }
       // 通道不可用：拒绝。
       case 'unavailable': return {
-        decision: { kind: 'deny', reason: `tool "${exec.name}" requires approval, but no approval channel is available` },
+        decision: approvalDenial(`tool "${exec.name}" requires approval, but no approval channel is available`, APPROVAL_UNAVAILABLE),
         approvalCancelled: false,
       }
       default: return assertNever(outcome, 'ApprovalOutcome')
@@ -637,7 +640,7 @@ export class ToolExecutionPipeline {
       return this.markCanonical(exec, {
         content: decision.feedback,
         isError: true,
-        error: { message },
+        error: { message, ...decision.info === undefined ? {} : { info: decision.info } },
         ...decisionContexts.length > 0 ? { additionalContexts: decisionContexts } : {},
       })
     }
@@ -870,15 +873,29 @@ function errorInfo(error: unknown): ToolErrorInfo | undefined {
   }
 }
 
+/** Materialize a non-granting approval outcome as a denial with routable `ApprovalError` identity. */
+function approvalDenial(reason: string, code: ApprovalErrorCode): Extract<PreToolDecision, { kind: 'deny' }> {
+  return { kind: 'deny', reason, info: { name: APPROVAL_ERROR_NAME, code } }
+}
+
+/** Whether a value thrown after cancellation is that cancellation and carries no identity of its own. */
+function isUnclassifiedCancellation(error: unknown, signal: AbortSignal): boolean {
+  if (errorInfo(error) !== undefined) return false
+  try {
+    return error === signal.reason || (error instanceof Error && error.name === 'AbortError')
+  } catch {
+    // A value whose prototype or `name` cannot be read is not a recognizable cancellation.
+    return false
+  }
+}
+
 /** Mint a same-process correlation token whose identity is its value. */
 // 铸造同进程关联令牌：符号的身份即其值。
 function createExecutionToken(): ToolExecutionToken {
   return Symbol('dsh.tool.execution') as ToolExecutionToken
 }
 
-// 任意抛出值 -> 规范错误结果（文本块带 Error: 前缀）。
-function toolErrorResult(error: unknown): ToolExecutionResult {
-  const info = errorInfo(error)
+function toolErrorResult(error: unknown, info = errorInfo(error)): ToolExecutionResult {
   const message = toolErrorMessage(error)
   return {
     content: [{ type: 'text', text: `Error: ${message}` }],
